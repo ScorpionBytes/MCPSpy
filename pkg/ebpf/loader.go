@@ -216,6 +216,43 @@ func (l *Loader) Close() error {
 	return nil
 }
 
+// AttachSSLProbes attaches SSL read/write probes to a specific library
+func (l *Loader) AttachSSLProbes(libraryPath string) error {
+	if l.objs == nil {
+		return fmt.Errorf("loader not loaded")
+	}
+
+	// Open the executable/library
+	ex, err := link.OpenExecutable(libraryPath)
+	if err != nil {
+		return fmt.Errorf("failed to open executable %s: %w", libraryPath, err)
+	}
+
+	// Attach SSL_read entry uprobe
+	sslReadEntryLink, err := ex.Uprobe("SSL_read", l.objs.SslReadEntry, nil)
+	if err != nil {
+		return fmt.Errorf("failed to attach SSL_read entry uprobe: %w", err)
+	}
+	l.links = append(l.links, sslReadEntryLink)
+
+	// Attach SSL_read exit uretprobe
+	sslReadExitLink, err := ex.Uretprobe("SSL_read", l.objs.SslReadExit, nil)
+	if err != nil {
+		return fmt.Errorf("failed to attach SSL_read exit uretprobe: %w", err)
+	}
+	l.links = append(l.links, sslReadExitLink)
+
+	// Attach SSL_write uprobe
+	sslWriteLink, err := ex.Uprobe("SSL_write", l.objs.SslWriteEntry, nil)
+	if err != nil {
+		return fmt.Errorf("failed to attach SSL_write uprobe: %w", err)
+	}
+	l.links = append(l.links, sslWriteLink)
+
+	logrus.WithField("library", libraryPath).Debug("SSL probes attached successfully")
+	return nil
+}
+
 // RunIterLibEnum triggers the eBPF iterator to enumerate all loaded libraries.
 // The discovered libraries will be sent to the event channel.
 func (l *Loader) RunIterLibEnum() error {

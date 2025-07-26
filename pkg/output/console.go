@@ -86,13 +86,35 @@ func (d *ConsoleDisplay) printMessage(msg *mcp.Message) {
 	// Format timestamp
 	ts := timestampColor.Sprint(msg.Timestamp.Format("15:04:05.000"))
 
-	// Format the communication flow
-	commFlow := fmt.Sprintf("%s[%s] → %s[%s]",
-		commColor.Sprint(msg.FromComm),
-		pidColor.Sprint(msg.FromPID),
-		commColor.Sprint(msg.ToComm),
-		pidColor.Sprint(msg.ToPID),
-	)
+	// Format the communication flow based on transport type
+	var commFlow string
+	var transportLabel string
+
+	switch msg.TransportType {
+	case mcp.TransportTypeStdio:
+		if msg.StdioTransport != nil {
+			commFlow = fmt.Sprintf("%s[%s] → %s[%s]",
+				commColor.Sprint(msg.StdioTransport.FromComm),
+				pidColor.Sprint(msg.StdioTransport.FromPID),
+				commColor.Sprint(msg.StdioTransport.ToComm),
+				pidColor.Sprint(msg.StdioTransport.ToPID),
+			)
+			transportLabel = "[stdio]"
+		}
+	case mcp.TransportTypeHTTP:
+		if msg.HTTPTransport != nil {
+			commFlow = fmt.Sprintf("%s[%s] → %s[%s]",
+				commColor.Sprint(msg.HTTPTransport.FromComm),
+				pidColor.Sprint(msg.HTTPTransport.FromPID),
+				commColor.Sprint(msg.HTTPTransport.ToComm),
+				pidColor.Sprint(msg.HTTPTransport.ToPID),
+			)
+			transportLabel = "[https]"
+		}
+	default:
+		commFlow = "unknown transport"
+		transportLabel = "[unknown]"
+	}
 
 	// Format message type and method
 	var msgInfo string
@@ -122,8 +144,9 @@ func (d *ConsoleDisplay) printMessage(msg *mcp.Message) {
 	}
 
 	// Print the main line with process-to-process communication
-	fmt.Fprintf(d.writer, "%s %s %s",
+	fmt.Fprintf(d.writer, "%s %s %s %s",
 		ts,
+		transportLabel,
 		commFlow,
 		msgInfo,
 	)

@@ -90,6 +90,14 @@ type StdioTransport struct {
 	ToComm   string `json:"to_comm"`
 }
 
+// HTTPTransport represents the info relevant for the HTTP transport.
+type HTTPTransport struct {
+	FromPID  uint32 `json:"from_pid"`
+	FromComm string `json:"from_comm"`
+	ToPID    uint32 `json:"to_pid"`
+	ToComm   string `json:"to_comm"`
+}
+
 // JSONRPCMessage represents a parsed JSON-RPC 2.0 message.
 type JSONRPCMessage struct {
 	Type   JSONRPCMessageType     `json:"type"`
@@ -112,6 +120,7 @@ type Message struct {
 	Timestamp       time.Time     `json:"timestamp"`
 	TransportType   TransportType `json:"transport_type"`
 	*StdioTransport `json:"stdio_transport,omitempty"`
+	*HTTPTransport  `json:"http_transport,omitempty"`
 
 	JSONRPCMessage
 
@@ -225,6 +234,63 @@ func (p *Parser) ParseData(data []byte, eventType ebpf.EventType, pid uint32, co
 				Raw:           string(msgData),
 				TransportType: TransportTypeStdio,
 				StdioTransport: &StdioTransport{
+					FromPID:  writeEvent.PID,
+					FromComm: writeEvent.Comm,
+					ToPID:    pid,
+					ToComm:   comm,
+				},
+				JSONRPCMessage: jsonRpcMsg,
+			})
+		}
+	}
+
+	return messages, nil
+}
+
+// ParseHTTPData parses MCP data from HTTP traffic captured via SSL
+func (p *Parser) ParseHTTPData(data []byte, eventType ebpf.EventType, pid uint32, comm string) ([]*Message, error) {
+	var messages []*Message
+
+	if eventType != ebpf.EventTypeWrite && eventType != ebpf.EventTypeRead {
+		return []*Message{}, fmt.Errorf("unknown event type: %d", eventType)
+	}
+
+	// Split the data into individual JSON messages
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		msgData := scanner.Bytes()
+		if len(bytes.TrimSpace(msgData)) == 0 {
+			continue
+		}
+
+		if eventType == ebpf.EventTypeWrite {
+			p.cacheWriteEvent(msgData, pid, comm)
+		} else {
+			hash := p.calculateHash(msgData)
+			writeEvent, ok := p.writeCache.Get(hash)
+			if !ok {
+				// No reason to keep iterating.
+				return []*Message{}, fmt.Errorf("no write event found for the parsed read event")
+			}
+
+			// Parse the message
+			jsonRpcMsg, err := p.parseJSONRPC(msgData)
+			if err != nil {
+				// No reason to keep iterating.
+				return []*Message{}, err
+			}
+
+			if ok, err := p.validateMCPMessage(jsonRpcMsg); !ok {
+				// No reason to keep iterating.
+				return []*Message{}, err
+			}
+
+			// Create message with HTTP transport type
+			messages = append(messages, &Message{
+				Timestamp:     time.Now(),
+				Raw:           string(msgData),
+				TransportType: TransportTypeHTTP,
+				HTTPTransport: &HTTPTransport{
 					FromPID:  writeEvent.PID,
 					FromComm: writeEvent.Comm,
 					ToPID:    pid,

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/alex-ilgayev/mcpspy/pkg/ebpf"
+	"github.com/alex-ilgayev/mcpspy/pkg/http"
 	"github.com/alex-ilgayev/mcpspy/pkg/mcp"
 	"github.com/alex-ilgayev/mcpspy/pkg/output"
 	"github.com/alex-ilgayev/mcpspy/pkg/version"
@@ -119,6 +121,7 @@ func run(cmd *cobra.Command, args []string) error {
 
 	// Create MCP parser and statistics
 	parser := mcp.NewParser()
+	httpParser := http.NewParser()
 	stats := make(map[string]int)
 
 	// Main event loop
@@ -143,8 +146,20 @@ func run(cmd *cobra.Command, args []string) error {
 					continue
 				}
 
-				// Parse raw eBPF event data into MCP messages
-				messages, err := parser.ParseData(buf, e.EventType, e.PID, e.Comm())
+				// Check if this is likely HTTP data (could be from SSL probes)
+				var messages []*mcp.Message
+				var err error
+
+				// Try to parse as HTTP first (for SSL traffic)
+				httpBody, httpErr := httpParser.ParseData(buf)
+				if httpErr == nil && httpBody != nil {
+					// This is HTTP data, parse the body for MCP messages
+					messages, err = parser.ParseHTTPData(httpBody, e.EventType, e.PID, e.Comm())
+				} else {
+					// Not HTTP, parse as regular stdio data
+					messages, err = parser.ParseData(buf, e.EventType, e.PID, e.Comm())
+				}
+
 				if err != nil {
 					logrus.WithError(err).Debug("Failed to parse data")
 					continue
@@ -165,15 +180,51 @@ func run(cmd *cobra.Command, args []string) error {
 					fileDisplay.PrintMessages(messages)
 				}
 			case *ebpf.LibraryEvent:
-				// Handle library events - for now just log them
+				// Handle library events - check if it's an SSL library
 				logrus.WithFields(logrus.Fields{
 					"pid":  e.PID,
 					"comm": e.Comm(),
 					"path": e.Path(),
 				}).Trace("Library loaded")
+
+				// Check if this is an SSL library we should hook
+				if isSSLLibrary(e.Path()) {
+					logrus.WithFields(logrus.Fields{
+						"pid":  e.PID,
+						"comm": e.Comm(),
+						"path": e.Path(),
+					}).Info("SSL library detected, attaching SSL probes")
+
+					if err := loader.AttachSSLProbes(e.Path()); err != nil {
+						logrus.WithError(err).WithField("path", e.Path()).Warn("Failed to attach SSL probes")
+					} else {
+						logrus.WithField("path", e.Path()).Info("SSL probes attached successfully")
+					}
+				}
 			default:
 				logrus.WithField("type", event.Type()).Warn("Unknown event type")
 			}
 		}
 	}
+}
+
+// isSSLLibrary checks if the given path is an SSL library we should hook
+func isSSLLibrary(path string) bool {
+	// List of patterns that indicate SSL libraries
+	sslPatterns := []string{
+		"libssl.so",
+		"libssl3.so",
+		"libssl.so.3",
+		"libssl.so.1",
+		// Also check for executables with statically linked SSL
+		"/node", // Node.js often has SSL statically linked
+	}
+
+	for _, pattern := range sslPatterns {
+		if strings.Contains(path, pattern) {
+			return true
+		}
+	}
+
+	return false
 }

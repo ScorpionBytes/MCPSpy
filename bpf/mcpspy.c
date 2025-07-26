@@ -40,6 +40,21 @@ struct library_event {
     __u8 path[PATH_MAX];
 };
 
+// Structure to pass SSL_read parameters from uprobe to uretprobe
+struct ssl_read_params {
+    __u64 ssl;
+    __u64 buf;
+    __u32 num;
+};
+
+// Map to store SSL_read parameters
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32); // PID
+    __type(value, struct ssl_read_params);
+} ssl_read_args SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 4 * 1024 * 1024); // 4MB buffer
@@ -201,6 +216,107 @@ int enumerate_loaded_modules(struct bpf_iter__task_vma *ctx) {
 
     bpf_ringbuf_submit(event, 0);
 
+    return 0;
+}
+
+// SSL_read uprobe - capture entry parameters
+SEC("uprobe/SSL_read")
+int BPF_PROG(ssl_read_entry, void *ssl, void *buf, int num) {
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    
+    struct ssl_read_params params = {
+        .ssl = (__u64)ssl,
+        .buf = (__u64)buf,
+        .num = num
+    };
+    
+    bpf_map_update_elem(&ssl_read_args, &pid, &params, BPF_ANY);
+    return 0;
+}
+
+// SSL_read uretprobe - capture return value and data
+SEC("uretprobe/SSL_read")
+int BPF_PROG(ssl_read_exit, int ret) {
+    if (ret <= 0) {
+        return 0;
+    }
+    
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    
+    // Retrieve the entry parameters
+    struct ssl_read_params *params = bpf_map_lookup_elem(&ssl_read_args, &pid);
+    if (!params) {
+        return 0;
+    }
+    
+    // Clean up the entry parameters
+    bpf_map_delete_elem(&ssl_read_args, &pid);
+    
+    // Check if this looks like MCP data
+    if (!is_mcp_data((const char *)params->buf, ret)) {
+        return 0;
+    }
+    
+    // Allocate event
+    struct data_event *event = bpf_ringbuf_reserve(&events, sizeof(struct data_event), 0);
+    if (!event) {
+        bpf_printk("error: failed to reserve ring buffer for SSL_read event");
+        return 0;
+    }
+    
+    // Fill event header
+    event->header.event_type = EVENT_READ;
+    event->header.pid = pid;
+    bpf_get_current_comm(&event->header.comm, sizeof(event->header.comm));
+    
+    // Copy data
+    event->size = ret;
+    event->buf_size = ret > MAX_BUF_SIZE ? MAX_BUF_SIZE : ret;
+    
+    if (bpf_probe_read(&event->buf, event->buf_size, (const void *)params->buf) != 0) {
+        bpf_ringbuf_discard(event, 0);
+        return 0;
+    }
+    
+    bpf_ringbuf_submit(event, 0);
+    return 0;
+}
+
+// SSL_write uprobe - capture data on entry
+SEC("uprobe/SSL_write")
+int BPF_PROG(ssl_write_entry, void *ssl, const void *buf, int num) {
+    if (num <= 0) {
+        return 0;
+    }
+    
+    // Check if this looks like MCP data
+    if (!is_mcp_data((const char *)buf, num)) {
+        return 0;
+    }
+    
+    // Allocate event
+    struct data_event *event = bpf_ringbuf_reserve(&events, sizeof(struct data_event), 0);
+    if (!event) {
+        bpf_printk("error: failed to reserve ring buffer for SSL_write event");
+        return 0;
+    }
+    
+    // Fill event header
+    event->header.event_type = EVENT_WRITE;
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    event->header.pid = pid;
+    bpf_get_current_comm(&event->header.comm, sizeof(event->header.comm));
+    
+    // Copy data
+    event->size = num;
+    event->buf_size = num > MAX_BUF_SIZE ? MAX_BUF_SIZE : num;
+    
+    if (bpf_probe_read(&event->buf, event->buf_size, buf) != 0) {
+        bpf_ringbuf_discard(event, 0);
+        return 0;
+    }
+    
+    bpf_ringbuf_submit(event, 0);
     return 0;
 }
 
